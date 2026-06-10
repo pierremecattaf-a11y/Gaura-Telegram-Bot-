@@ -19,6 +19,7 @@ import httpx
 import logging
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 import config
 import storage
@@ -28,6 +29,15 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 app = FastAPI(title="Gaura Telegram Bot")
+
+# ── CORS — allow requests from claude.ai and any local dev origin ─────────────
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],          # allow all origins (including claude.ai artifacts)
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
 
 TELEGRAM_API = "https://api.telegram.org/bot" + config.TELEGRAM_TOKEN
 
