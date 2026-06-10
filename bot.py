@@ -30,10 +30,10 @@ log = logging.getLogger(__name__)
 
 app = FastAPI(title="Gaura Telegram Bot")
 
-# ── CORS — allow requests from claude.ai and any local dev origin ─────────────
+# ── CORS ──────────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # allow all origins (including claude.ai artifacts)
+    allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
@@ -63,6 +63,55 @@ async def send(chat_id: int, text: str, reply_to: int = None):
 
 async def send_typing(chat_id: int):
     await tg("sendChatAction", chat_id=chat_id, action="typing")
+
+
+# ── Voice transcription ───────────────────────────────────────────────────────
+
+async def transcribe_voice(file_id: str) -> str | None:
+    """
+    Download a Telegram voice/audio file and transcribe it using OpenAI Whisper.
+    Returns the transcript text, or None if transcription fails.
+    """
+    if not config.OPENAI_API_KEY:
+        log.warning("OPENAI_API_KEY not set — cannot transcribe voice notes")
+        return None
+
+    try:
+        # Step 1: get the file path from Telegram
+        file_info = await tg("getFile", file_id=file_id)
+        file_path = file_info.get("result", {}).get("file_path")
+        if not file_path:
+            log.error("Could not get file_path for file_id %s", file_id)
+            return None
+
+        # Step 2: download the audio bytes
+        download_url = f"https://api.telegram.org/file/bot{config.TELEGRAM_TOKEN}/{file_path}"
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            audio_resp = await client.get(download_url)
+            audio_resp.raise_for_status()
+            audio_bytes = audio_resp.content
+
+        # Step 3: send to OpenAI Whisper
+        # Telegram voice notes are .oga (ogg/opus) — Whisper accepts them natively
+        filename = file_path.split("/")[-1]
+        if "." not in filename:
+            filename += ".oga"
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            whisper_resp = await client.post(
+                "https://api.openai.com/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {config.OPENAI_API_KEY}"},
+                files={"file": (filename, audio_bytes, "audio/ogg")},
+                data={"model": "whisper-1", "response_format": "text"},
+            )
+            whisper_resp.raise_for_status()
+            transcript = whisper_resp.text.strip()
+            log.info("Transcribed voice note: %s...", transcript[:80])
+            return transcript
+
+    except Exception as e:
+        log.error("Transcription failed: %s", e)
+        return None
 
 
 # ── Session lookup helpers ────────────────────────────────────────────────────
@@ -128,12 +177,7 @@ async def handle_start(chat_id: int, user_id: int, username: str):
         await send(chat_id, "No active session found for this group. Ask the admin to run `/setup` first.")
         return
 
-    # Don't let the admin trigger /start
-    if user_id == sess.get("admin_user_id"):
-        await send(chat_id, "You are the session admin. Ask the interviewee to send `/start`.")
-        return
-
-    # Register interviewee
+    # Register interviewee (admin can also start, e.g. for facilitated sessions)
     sess["interviewee_user_id"] = user_id
     sess["status"] = "active"
     storage.save_session(sid, sess)
@@ -230,8 +274,11 @@ async def handle_reply(chat_id: int, user_id: int, text: str, message_id: int):
     if not sess:
         return
 
-    # Only respond to the confirmed interviewee
-    if user_id != sess.get("interviewee_user_id"):
+    # Accept messages from the confirmed interviewee OR the admin
+    # (admin types on behalf of the interviewee in facilitated sessions)
+    is_admin = user_id == sess.get("admin_user_id")
+    is_interviewee = user_id == sess.get("interviewee_user_id")
+    if not is_admin and not is_interviewee:
         return
 
     # Ignore if paused
@@ -332,6 +379,39 @@ async def webhook(secret: str, request: Request):
     text       = message.get("text", "").strip()
     message_id = message.get("message_id")
 
+    # ── Handle voice notes and audio messages ────────────────────────────────
+    voice = message.get("voice") or message.get("audio")
+    if voice and not text:
+        file_id  = voice.get("file_id")
+        duration = voice.get("duration", 0)
+        log.info("Voice note received: file_id=%s duration=%ss", file_id, duration)
+
+        # Let the user know we're processing
+        await send_typing(chat_id)
+        await send(chat_id, "_🎙 Voice note received — transcribing..._")
+
+        transcript = await transcribe_voice(file_id)
+
+        if not transcript:
+            if not config.OPENAI_API_KEY:
+                await send(chat_id,
+                    "⚠️ Voice notes require an OpenAI API key for transcription.\n"
+                    "Add `OPENAI_API_KEY` to your Railway environment variables, "
+                    "or type your answer as text.")
+            else:
+                await send(chat_id,
+                    "⚠️ Could not transcribe the voice note. "
+                    "Please try again or type your answer.")
+            return JSONResponse({"ok": True})
+
+        # Show the transcript so the user can confirm what was heard
+        await send(chat_id, f'_Transcript: "{transcript}"_')
+
+        # Route as a normal reply
+        await handle_reply(chat_id, user_id, transcript, message_id)
+        return JSONResponse({"ok": True})
+
+    # ── Ignore messages with no text and no voice ────────────────────────────
     if not text:
         return JSONResponse({"ok": True})
 
