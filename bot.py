@@ -433,3 +433,161 @@ async def register_webhook():
         log.info("Webhook registered: %s", url)
     else:
         log.warning("Webhook registration failed: %s", result)
+
+
+# ── Session creator page (opened in new tab from Gaura) ───────────────────────
+# This page is opened by the user in a new browser tab.
+# It receives session params via query string, creates the session,
+# and shows the setup command — no iframe restrictions.
+
+from fastapi.responses import HTMLResponse
+from urllib.parse import unquote
+
+@app.get("/create", response_class=HTMLResponse)
+async def create_page(
+    campaign_id: str = "",
+    name: str = "",
+    role: str = "",
+    tone: str = "Conversational",
+    depth: str = "Deep",
+    length: str = "standard",
+):
+    name    = unquote(name)
+    role    = unquote(role)
+    safe_n  = name.replace("'", "\\'")
+    safe_r  = role.replace("'", "\\'")
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Gaura — Create Interview Session</title>
+  <style>
+    * {{ box-sizing:border-box; margin:0; padding:0; }}
+    body {{ font-family:-apple-system,'Segoe UI',sans-serif; background:#F9FAFB;
+            display:flex; align-items:center; justify-content:center;
+            min-height:100vh; padding:24px; }}
+    .card {{ background:#fff; border:1px solid #E5E7EB; border-radius:14px;
+             padding:32px; max-width:480px; width:100%;
+             box-shadow:0 4px 24px rgba(0,0,0,0.08); }}
+    .logo {{ width:36px; height:36px; background:#1a1a2e; border-radius:9px;
+             display:flex; align-items:center; justify-content:center;
+             font-weight:700; color:#fff; font-size:16px; margin-bottom:16px; }}
+    h1 {{ font-size:18px; color:#111827; margin-bottom:4px; }}
+    .sub {{ font-size:13px; color:#6B7280; margin-bottom:24px; }}
+    .field {{ margin-bottom:16px; }}
+    .field label {{ font-size:11px; font-weight:600; color:#6B7280;
+                    text-transform:uppercase; letter-spacing:0.4px;
+                    display:block; margin-bottom:5px; }}
+    .field input {{ width:100%; border:1px solid #E5E7EB; border-radius:8px;
+                    padding:9px 12px; font-size:13px; color:#111827;
+                    outline:none; background:#F9FAFB; }}
+    .btn {{ width:100%; background:#1a1a2e; color:#fff; border:none;
+            border-radius:9px; padding:12px; font-size:14px; font-weight:600;
+            cursor:pointer; margin-top:8px; }}
+    .btn:disabled {{ opacity:0.5; cursor:not-allowed; }}
+    .result {{ display:none; margin-top:24px; padding:16px;
+               background:#F0FDF4; border:1px solid #BBF7D0; border-radius:10px; }}
+    .result h3 {{ font-size:13px; font-weight:600; color:#0F6E56; margin-bottom:12px; }}
+    .steps {{ font-size:12px; color:#374151; line-height:1.9; margin-bottom:12px; white-space:pre-wrap; }}
+    .cmd-row {{ display:flex; gap:8px; }}
+    .cmd {{ flex:1; font-family:monospace; font-size:11px; background:#fff;
+             border:1px solid #BBF7D0; border-radius:6px; padding:8px 10px;
+             color:#1a1a2e; outline:none; cursor:text; }}
+    .copy-btn {{ background:#0F6E56; color:#fff; border:none; border-radius:6px;
+                 padding:8px 14px; font-size:11px; font-weight:600; cursor:pointer;
+                 white-space:nowrap; }}
+    .error {{ display:none; margin-top:16px; padding:12px; background:#FEF2F2;
+              border:1px solid #FECACA; border-radius:8px; font-size:12px; color:#DC2626; }}
+    .spinner {{ display:inline-block; width:14px; height:14px; border:2px solid rgba(255,255,255,0.3);
+                border-top-color:#fff; border-radius:50%; animation:spin 0.7s linear infinite;
+                vertical-align:middle; margin-right:6px; }}
+    @keyframes spin {{ to {{ transform:rotate(360deg); }} }}
+  </style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">G</div>
+  <h1>Create interview session</h1>
+  <p class="sub">This will register a Telegram interview session for this interviewee.</p>
+
+  <div class="field">
+    <label>Interviewee name</label>
+    <input id="iname" value="{safe_n}" placeholder="Full name" />
+  </div>
+  <div class="field">
+    <label>Job title</label>
+    <input id="irole" value="{safe_r}" placeholder="e.g. Operations Manager" />
+  </div>
+
+  <button class="btn" id="create-btn" onclick="createSession()">
+    Create Telegram session
+  </button>
+
+  <div class="result" id="result">
+    <h3>Session created</h3>
+    <p class="steps" id="steps"></p>
+    <div class="cmd-row">
+      <input class="cmd" id="cmd" readonly onclick="this.select()" />
+      <button class="copy-btn" onclick="copyCmd()">Copy</button>
+    </div>
+  </div>
+  <div class="error" id="err"></div>
+</div>
+
+<script>
+async function createSession() {{
+  var btn  = document.getElementById('create-btn');
+  var name = document.getElementById('iname').value.trim();
+  var role = document.getElementById('irole').value.trim();
+  if (!name) {{ showErr('Please enter the interviewee name.'); return; }}
+
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Creating...';
+  document.getElementById('err').style.display = 'none';
+
+  try {{
+    var res = await fetch('/create-session', {{
+      method: 'POST',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{
+        campaign_id:      '{campaign_id}',
+        interviewee_name: name,
+        interviewee_role: role,
+        guide:            {{}},
+        config:           {{tone:'{tone}', depth:'{depth}', length:'{length}'}},
+        mode:             'group'
+      }})
+    }});
+    if (!res.ok) throw new Error('Server error ' + res.status);
+    var data = await res.json();
+    document.getElementById('steps').textContent = data.instructions;
+    document.getElementById('cmd').value         = data.setup_command;
+    document.getElementById('result').style.display = 'block';
+    btn.style.display = 'none';
+  }} catch(e) {{
+    showErr('Failed to create session: ' + e.message);
+    btn.disabled = false;
+    btn.innerHTML = 'Create Telegram session';
+  }}
+}}
+
+function copyCmd() {{
+  var inp = document.getElementById('cmd');
+  inp.select();
+  document.execCommand('copy');
+  var b = document.querySelector('.copy-btn');
+  b.textContent = 'Copied!';
+  setTimeout(function(){{ b.textContent = 'Copy'; }}, 2000);
+}}
+
+function showErr(msg) {{
+  var el = document.getElementById('err');
+  el.textContent = msg;
+  el.style.display = 'block';
+}}
+</script>
+</body>
+</html>"""
+    return HTMLResponse(html)
