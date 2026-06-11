@@ -592,6 +592,21 @@ async def health():
     return {"status": "ok", "mode": config.INTERVIEW_MODE}
 
 
+@app.get("/debug")
+async def debug():
+    """Shows exactly what config Railway has loaded. Visit this URL in your browser."""
+    return {
+        "claude_model":            config.CLAUDE_MODEL,
+        "anthropic_key_set":       bool(config.ANTHROPIC_API_KEY),
+        "anthropic_key_prefix":    config.ANTHROPIC_API_KEY[:12] + "..." if config.ANTHROPIC_API_KEY else "MISSING",
+        "telegram_token_set":      bool(config.TELEGRAM_TOKEN),
+        "base_url":                config.BASE_URL or "NOT SET",
+        "interview_mode":          config.INTERVIEW_MODE,
+        "storage_backend":         config.STORAGE_BACKEND,
+        "openai_key_set":          bool(config.OPENAI_API_KEY),
+    }
+
+
 # ── Register webhook (run once) ───────────────────────────────────────────────
 
 @app.on_event("startup")
