@@ -257,15 +257,15 @@ async def handle_end(chat_id: int, user_id: int):
 
 async def handle_status(chat_id: int):
     """
-    /status — show current session state. Useful for debugging.
+    /status — show current session state.
     """
     sid, sess = find_session_for_group(chat_id)
     if not sess:
         await send(chat_id, "No active session in this group.")
         return
-    questions = sess.get("guide", {}).get("questions", [])
+    questions = (sess.get("guide") or {}).get("questions") or []
     q_index   = sess.get("question_index", 0)
-    turns     = len(sess.get("history", []))
+    turns     = len(sess.get("history") or [])
     await send(
         chat_id,
         f"*Session:* `{sid}`\n"
@@ -274,6 +274,67 @@ async def handle_status(chat_id: int):
         f"*Progress:* Q{q_index + 1} of {len(questions)}\n"
         f"*Turns:* {turns}"
     )
+
+
+async def handle_check(chat_id: int):
+    """
+    /check — verify all API keys and config are working.
+    Run this before starting an interview to catch problems early.
+    """
+    lines = []
+
+    # Check Telegram token
+    me = await tg("getMe")
+    if me.get("ok"):
+        lines.append("✅ Telegram token valid — bot: @" + me["result"].get("username","?"))
+    else:
+        lines.append("❌ Telegram token invalid or missing")
+
+    # Check Anthropic API key
+    if not config.ANTHROPIC_API_KEY:
+        lines.append("❌ ANTHROPIC_API_KEY is not set in Railway Variables")
+    else:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key": config.ANTHROPIC_API_KEY,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    },
+                    json={
+                        "model": config.CLAUDE_MODEL,
+                        "max_tokens": 10,
+                        "messages": [{"role": "user", "content": "Hi"}],
+                    },
+                )
+            if resp.status_code == 200:
+                lines.append("✅ Anthropic API key valid")
+            elif resp.status_code == 401:
+                lines.append("❌ Anthropic API key is invalid (401 Unauthorized)")
+            elif resp.status_code == 404:
+                lines.append("❌ Anthropic API key missing or wrong (404) — check ANTHROPIC_API_KEY in Railway Variables")
+            else:
+                lines.append(f"⚠️ Anthropic API returned {resp.status_code}")
+        except Exception as e:
+            lines.append(f"❌ Anthropic API error: {e}")
+
+    # Check OpenAI key (optional)
+    if config.OPENAI_API_KEY:
+        lines.append("✅ OpenAI API key set (voice transcription enabled)")
+    else:
+        lines.append("ℹ️ OPENAI_API_KEY not set — voice notes will not be transcribed")
+
+    # Check storage
+    try:
+        storage.save_session("__test__", {"test": True})
+        storage.delete_session("__test__")
+        lines.append("✅ Storage working")
+    except Exception as e:
+        lines.append(f"❌ Storage error: {e}")
+
+    await send(chat_id, "*System check*\n\n" + "\n".join(lines))
 
 
 # ── Core reply logic ──────────────────────────────────────────────────────────
@@ -458,6 +519,7 @@ async def webhook(secret: str, request: Request):
         elif command == "/resume": await handle_resume(chat_id, user_id)
         elif command == "/end":    await handle_end(chat_id, user_id)
         elif command == "/status": await handle_status(chat_id)
+        elif command == "/check":  await handle_check(chat_id)
     else:
         # Regular message — treat as interviewee reply
         await handle_reply(chat_id, user_id, text, message_id)
@@ -533,16 +595,32 @@ async def health():
 # ── Register webhook (run once) ───────────────────────────────────────────────
 
 @app.on_event("startup")
-async def register_webhook():
-    if not config.BASE_URL or not config.TELEGRAM_TOKEN:
-        log.warning("BASE_URL or TELEGRAM_TOKEN not set — webhook not registered")
-        return
-    url = f"{config.BASE_URL}/webhook/{config.WEBHOOK_SECRET}"
-    result = await tg("setWebhook", url=url, allowed_updates=["message"])
-    if result.get("ok"):
-        log.info("Webhook registered: %s", url)
+async def startup_checks():
+    """Validate required environment variables on startup and log clearly."""
+    missing = []
+    if not config.TELEGRAM_TOKEN:
+        missing.append("TELEGRAM_TOKEN")
+    if not config.ANTHROPIC_API_KEY:
+        missing.append("ANTHROPIC_API_KEY")
+    if not config.BASE_URL:
+        missing.append("BASE_URL (webhook will not be registered)")
+
+    if missing:
+        log.warning("=" * 60)
+        log.warning("MISSING ENVIRONMENT VARIABLES: %s", ", ".join(missing))
+        log.warning("Set these in Railway → Variables, then redeploy.")
+        log.warning("=" * 60)
     else:
-        log.warning("Webhook registration failed: %s", result)
+        log.info("All required environment variables are set.")
+
+    # Register webhook
+    if config.BASE_URL and config.TELEGRAM_TOKEN:
+        url = f"{config.BASE_URL}/webhook/{config.WEBHOOK_SECRET}"
+        result = await tg("setWebhook", url=url, allowed_updates=["message"])
+        if result.get("ok"):
+            log.info("Webhook registered: %s", url)
+        else:
+            log.warning("Webhook registration failed: %s", result)
 
 
 # ── Session creator page (opened in new tab from Gaura) ───────────────────────
