@@ -169,23 +169,33 @@ async def handle_setup(chat_id: int, user_id: int, args: list[str]):
 
 async def handle_start(chat_id: int, user_id: int, username: str):
     """
-    /start
-    Interviewee sends this to begin. Bot confirms them and opens the interview.
+    /start — begins the interview.
+    Can be sent by the interviewee OR the admin (for facilitated sessions).
     """
     sid, sess = find_session_for_group(chat_id)
     if not sess:
         await send(chat_id, "No active session found for this group. Ask the admin to run `/setup` first.")
         return
 
-    # Register interviewee (admin can also start, e.g. for facilitated sessions)
+    # Register whoever sends /start as the interviewee
     sess["interviewee_user_id"] = user_id
     sess["status"] = "active"
     storage.save_session(sid, sess)
 
+    log.info("Interview starting: session=%s user=%s", sid, user_id)
     await send_typing(chat_id)
 
-    # Get the opening message from Claude
-    reply = await interview.get_next_message(sess)
+    try:
+        reply = await interview.get_next_message(sess)
+        log.info("Opening message generated, length=%d", len(reply))
+    except Exception as e:
+        log.error("Failed to get opening message: %s", e)
+        await send(chat_id, "⚠️ Could not start the interview. Error: " + str(e))
+        return
+
+    if not reply:
+        await send(chat_id, "⚠️ Got an empty response from Claude. Please check your ANTHROPIC_API_KEY.")
+        return
 
     # Store the opening turn
     sess["history"].append({"role": "assistant", "text": reply})
@@ -298,11 +308,31 @@ async def handle_reply(chat_id: int, user_id: int, text: str, message_id: int):
     storage.save_session(sid, sess)
     await send_typing(chat_id)
 
-    # Get Claude's next message
-    reply = await interview.get_next_message(sess)
+    # Advance question index safely
+    if interview.should_advance_question(sess, text):
+        questions = (sess.get("guide") or {}).get("questions") or []
+        if questions:
+            sess["question_index"] = min(
+                sess.get("question_index", 0) + 1,
+                len(questions) - 1
+            )
+        storage.save_session(sid, sess)
+
+    # Get Claude's next message with error handling
+    try:
+        reply = await interview.get_next_message(sess)
+        log.info("Reply generated for session %s, length=%d", sid, len(reply))
+    except Exception as e:
+        log.error("Failed to generate reply: %s", e)
+        await send(chat_id, "Error generating response: " + str(e))
+        return
+
+    if not reply:
+        await send(chat_id, "Got an empty response — please try sending your answer again.")
+        return
+
     sess["history"].append({"role": "assistant", "text": reply})
     storage.save_session(sid, sess)
-
     await send(chat_id, reply)
 
     # Check if interview is naturally complete
@@ -522,6 +552,7 @@ async def register_webhook():
 
 from fastapi.responses import HTMLResponse
 from urllib.parse import unquote
+import base64
 
 @app.get("/create", response_class=HTMLResponse)
 async def create_page(
@@ -531,11 +562,20 @@ async def create_page(
     tone: str = "Conversational",
     depth: str = "Deep",
     length: str = "standard",
+    guide_b64: str = "",
 ):
-    name    = unquote(name)
-    role    = unquote(role)
-    safe_n  = name.replace("'", "\\'")
-    safe_r  = role.replace("'", "\\'")
+    name   = unquote(name)
+    role   = unquote(role)
+    safe_n = name.replace("'", "\'")
+    safe_r = role.replace("'", "\'")
+
+    # Decode guide from base64 if provided
+    guide_json = "{}"
+    if guide_b64:
+        try:
+            guide_json = base64.b64decode(guide_b64.encode()).decode("utf-8")
+        except Exception:
+            guide_json = "{}"
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -555,14 +595,12 @@ async def create_page(
              display:flex; align-items:center; justify-content:center;
              font-weight:700; color:#fff; font-size:16px; margin-bottom:16px; }}
     h1 {{ font-size:18px; color:#111827; margin-bottom:4px; }}
-    .sub {{ font-size:13px; color:#6B7280; margin-bottom:24px; }}
-    .field {{ margin-bottom:16px; }}
-    .field label {{ font-size:11px; font-weight:600; color:#6B7280;
-                    text-transform:uppercase; letter-spacing:0.4px;
-                    display:block; margin-bottom:5px; }}
-    .field input {{ width:100%; border:1px solid #E5E7EB; border-radius:8px;
-                    padding:9px 12px; font-size:13px; color:#111827;
-                    outline:none; background:#F9FAFB; }}
+    .sub {{ font-size:13px; color:#6B7280; margin-bottom:24px; line-height:1.5; }}
+    .meta {{ background:#F9FAFB; border:1px solid #E5E7EB; border-radius:8px;
+             padding:12px 14px; margin-bottom:20px; font-size:12px; color:#374151; line-height:1.7; }}
+    .meta strong {{ color:#111827; }}
+    .q-count {{ display:inline-block; background:#EFF6FF; color:#2563EB;
+                padding:2px 8px; border-radius:10px; font-size:11px; font-weight:600; }}
     .btn {{ width:100%; background:#1a1a2e; color:#fff; border:none;
             border-radius:9px; padding:12px; font-size:14px; font-weight:600;
             cursor:pointer; margin-top:8px; }}
@@ -590,15 +628,12 @@ async def create_page(
 <div class="card">
   <div class="logo">G</div>
   <h1>Create interview session</h1>
-  <p class="sub">This will register a Telegram interview session for this interviewee.</p>
+  <p class="sub">This will register a Telegram interview session and give you the setup command.</p>
 
-  <div class="field">
-    <label>Interviewee name</label>
-    <input id="iname" value="{safe_n}" placeholder="Full name" />
-  </div>
-  <div class="field">
-    <label>Job title</label>
-    <input id="irole" value="{safe_r}" placeholder="e.g. Operations Manager" />
+  <div class="meta">
+    <strong>Interviewee:</strong> {safe_n}<br>
+    <strong>Role:</strong> {safe_r or "—"}<br>
+    <strong>Guide:</strong> <span class="q-count" id="q-count">loading...</span>
   </div>
 
   <button class="btn" id="create-btn" onclick="createSession()">
@@ -606,7 +641,7 @@ async def create_page(
   </button>
 
   <div class="result" id="result">
-    <h3>Session created</h3>
+    <h3>✅ Session created</h3>
     <p class="steps" id="steps"></p>
     <div class="cmd-row">
       <input class="cmd" id="cmd" readonly onclick="this.select()" />
@@ -617,12 +652,12 @@ async def create_page(
 </div>
 
 <script>
-async function createSession() {{
-  var btn  = document.getElementById('create-btn');
-  var name = document.getElementById('iname').value.trim();
-  var role = document.getElementById('irole').value.trim();
-  if (!name) {{ showErr('Please enter the interviewee name.'); return; }}
+var GUIDE = {guide_json};
+var qCount = (GUIDE && GUIDE.questions) ? GUIDE.questions.length : 0;
+document.getElementById('q-count').textContent = qCount + ' question' + (qCount !== 1 ? 's' : '');
 
+async function createSession() {{
+  var btn = document.getElementById('create-btn');
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span> Creating...';
   document.getElementById('err').style.display = 'none';
@@ -633,21 +668,24 @@ async function createSession() {{
       headers: {{'Content-Type': 'application/json'}},
       body: JSON.stringify({{
         campaign_id:      '{campaign_id}',
-        interviewee_name: name,
-        interviewee_role: role,
-        guide:            {{}},
+        interviewee_name: '{safe_n}',
+        interviewee_role: '{safe_r}',
+        guide:            GUIDE,
         config:           {{tone:'{tone}', depth:'{depth}', length:'{length}'}},
         mode:             'group'
       }})
     }});
-    if (!res.ok) throw new Error('Server error ' + res.status);
+    if (!res.ok) {{
+      var txt = await res.text();
+      throw new Error('Server error ' + res.status + ': ' + txt.slice(0,200));
+    }}
     var data = await res.json();
     document.getElementById('steps').textContent = data.instructions;
     document.getElementById('cmd').value         = data.setup_command;
     document.getElementById('result').style.display = 'block';
     btn.style.display = 'none';
   }} catch(e) {{
-    showErr('Failed to create session: ' + e.message);
+    showErr('Failed: ' + e.message);
     btn.disabled = false;
     btn.innerHTML = 'Create Telegram session';
   }}
@@ -671,3 +709,5 @@ function showErr(msg) {{
 </body>
 </html>"""
     return HTMLResponse(html)
+
+
