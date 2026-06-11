@@ -6,7 +6,7 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "gaura-secret-2024")
 
 # ── Claude ────────────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+CLAUDE_MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 400
 
 # ── Speech-to-text (OpenAI Whisper) ──────────────────────────────────────────
