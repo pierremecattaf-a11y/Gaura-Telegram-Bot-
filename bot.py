@@ -147,6 +147,18 @@ async def handle_setup(chat_id: int, user_id: int, args: list[str]):
         await send(chat_id, f"Session `{session_id}` not found. Generate it from Gaura first.")
         return
 
+    # Deactivate any previous session bound to this group chat.
+    # Without this, find_session_for_group would still match the old
+    # session (status=active) and the new one would never be used.
+    for old_sid in storage.list_sessions():
+        if old_sid == session_id:
+            continue
+        old_sess = storage.load_session(old_sid)
+        if old_sess and old_sess.get("group_chat_id") == chat_id and old_sess.get("status") in ("pending", "active"):
+            old_sess["status"] = "superseded"
+            storage.save_session(old_sid, old_sess)
+            log.info("Superseded old session %s for chat %s", old_sid, chat_id)
+
     sess["group_chat_id"] = chat_id
     sess["admin_user_id"]  = user_id
     storage.save_session(session_id, sess)
@@ -253,6 +265,21 @@ async def handle_end(chat_id: int, user_id: int):
     if not sess or user_id != sess.get("admin_user_id"):
         return
     await finish_interview(sid, sess, chat_id, early=True)
+
+
+async def handle_reset(chat_id: int, user_id: int):
+    """
+    /reset — admin command. Marks all sessions for this group as superseded,
+    so a fresh /setup starts clean. Useful during testing.
+    """
+    count = 0
+    for sid in storage.list_sessions():
+        sess = storage.load_session(sid)
+        if sess and sess.get("group_chat_id") == chat_id:
+            sess["status"] = "superseded"
+            storage.save_session(sid, sess)
+            count += 1
+    await send(chat_id, f"_Reset: {count} session(s) for this group marked inactive. Run /setup with a new session ID._")
 
 
 async def handle_status(chat_id: int):
@@ -520,6 +547,7 @@ async def webhook(secret: str, request: Request):
         elif command == "/end":    await handle_end(chat_id, user_id)
         elif command == "/status": await handle_status(chat_id)
         elif command == "/check":  await handle_check(chat_id)
+        elif command == "/reset":  await handle_reset(chat_id, user_id)
     else:
         # Regular message — treat as interviewee reply
         await handle_reply(chat_id, user_id, text, message_id)
