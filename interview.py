@@ -5,6 +5,7 @@ calls Claude, detects interview completion, generates insight report.
 """
 
 import json
+import logging
 import httpx
 from config import ANTHROPIC_API_KEY, CLAUDE_MODEL, MAX_TOKENS
 
@@ -186,16 +187,9 @@ async def get_next_message(session: dict) -> str:
             )
         }]
 
-    async with httpx.AsyncClient(timeout=45.0) as client:
-        import logging
-        log = logging.getLogger(__name__)
-        log.info("=== CLAUDE REQUEST DEBUG ===")
-        log.info("sys_prompt length: %d", len(sys_prompt))
-        log.info("sys_prompt first 300 chars: %r", sys_prompt[:300])
-        log.info("sys_prompt last 300 chars: %r", sys_prompt[-300:])
-        log.info("messages: %r", messages)
-        log.info("model: %r", CLAUDE_MODEL)
+    log = logging.getLogger(__name__)
 
+    async with httpx.AsyncClient(timeout=45.0) as client:
         resp = await client.post(
             "https://api.anthropic.com/v1/messages",
             headers={
@@ -211,9 +205,8 @@ async def get_next_message(session: dict) -> str:
             },
         )
 
-        log.info("=== CLAUDE RESPONSE DEBUG ===")
-        log.info("status_code: %d", resp.status_code)
-        log.info("response body first 500 chars: %r", resp.text[:500])
+        if resp.status_code != 200:
+            log.error("Claude API error %d: %s", resp.status_code, resp.text[:300])
 
         resp.raise_for_status()
         data = resp.json()
