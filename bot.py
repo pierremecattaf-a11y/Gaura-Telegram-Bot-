@@ -15,10 +15,12 @@ DM MODE (future):
 """
 
 import json
+import base64
 import httpx
 import logging
+from urllib.parse import unquote
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 import config
@@ -368,26 +370,20 @@ async def handle_check(chat_id: int):
 
 async def handle_reply(chat_id: int, user_id: int, text: str, message_id: int):
     """Process an interviewee reply and generate the next question."""
-    log.info("handle_reply called: chat=%s user=%s text=%r", chat_id, user_id, text[:80])
-
     sid, sess = find_session_for_group(chat_id)
     if not sess:
-        log.warning("handle_reply: no session found for chat %s", chat_id)
+        log.warning("handle_reply: no active session for chat %s", chat_id)
         return
 
-    log.info("handle_reply: session=%s status=%s admin=%s interviewee=%s",
-             sid, sess.get("status"), sess.get("admin_user_id"), sess.get("interviewee_user_id"))
-
     # Accept messages from the confirmed interviewee OR the admin
+    # (admin can type on behalf of the interviewee in facilitated sessions)
     is_admin       = user_id == sess.get("admin_user_id")
     is_interviewee = user_id == sess.get("interviewee_user_id")
     if not is_admin and not is_interviewee:
-        log.warning("handle_reply: user %s is neither admin nor interviewee — ignoring", user_id)
         return
 
     # Ignore if paused
     if sess.get("status") == "paused":
-        log.info("handle_reply: session paused — ignoring")
         return
 
     # Add user reply to history
@@ -405,7 +401,6 @@ async def handle_reply(chat_id: int, user_id: int, text: str, message_id: int):
     storage.save_session(sid, sess)
     await send_typing(chat_id)
 
-    log.info("handle_reply: calling get_next_message...")
     try:
         reply = await interview.get_next_message(sess)
         log.info("Reply generated for session %s, length=%d", sid, len(reply))
@@ -496,8 +491,8 @@ async def webhook(secret: str, request: Request):
     text       = message.get("text", "").strip()
     message_id = message.get("message_id")
 
-    log.info("Webhook message: chat=%s user=%s username=%s text=%r has_voice=%s",
-             chat_id, user_id, username, text[:80], bool(message.get("voice") or message.get("audio")))
+    log.info("Webhook message: chat=%s user=%s type=%s",
+             chat_id, user_id, "voice" if (message.get("voice") or message.get("audio")) else "text")
 
     # ── Handle voice notes and audio messages ────────────────────────────────
     voice = message.get("voice") or message.get("audio")
@@ -624,16 +619,16 @@ async def health():
 
 @app.get("/debug")
 async def debug():
-    """Shows exactly what config Railway has loaded. Visit this URL in your browser."""
+    """Shows whether config is loaded correctly, without exposing secrets."""
     return {
-        "claude_model":            config.CLAUDE_MODEL,
-        "anthropic_key_set":       bool(config.ANTHROPIC_API_KEY),
-        "anthropic_key_prefix":    config.ANTHROPIC_API_KEY[:12] + "..." if config.ANTHROPIC_API_KEY else "MISSING",
-        "telegram_token_set":      bool(config.TELEGRAM_TOKEN),
-        "base_url":                config.BASE_URL or "NOT SET",
-        "interview_mode":          config.INTERVIEW_MODE,
-        "storage_backend":         config.STORAGE_BACKEND,
-        "openai_key_set":          bool(config.OPENAI_API_KEY),
+        "claude_model":       config.CLAUDE_MODEL,
+        "anthropic_key_set":  bool(config.ANTHROPIC_API_KEY),
+        "telegram_token_set": bool(config.TELEGRAM_TOKEN),
+        "telegram_token_length": len(config.TELEGRAM_TOKEN),
+        "base_url":           config.BASE_URL or "NOT SET",
+        "interview_mode":     config.INTERVIEW_MODE,
+        "storage_backend":    config.STORAGE_BACKEND,
+        "openai_key_set":     bool(config.OPENAI_API_KEY),
     }
 
 
@@ -672,10 +667,6 @@ async def startup_checks():
 # This page is opened by the user in a new browser tab.
 # It receives session params via query string, creates the session,
 # and shows the setup command — no iframe restrictions.
-
-from fastapi.responses import HTMLResponse
-from urllib.parse import unquote
-import base64
 
 @app.get("/create", response_class=HTMLResponse)
 async def create_page(
