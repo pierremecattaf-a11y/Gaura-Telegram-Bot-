@@ -368,35 +368,32 @@ async def handle_check(chat_id: int):
 
 async def handle_reply(chat_id: int, user_id: int, text: str, message_id: int):
     """Process an interviewee reply and generate the next question."""
+    log.info("handle_reply called: chat=%s user=%s text=%r", chat_id, user_id, text[:80])
+
     sid, sess = find_session_for_group(chat_id)
     if not sess:
+        log.warning("handle_reply: no session found for chat %s", chat_id)
         return
 
+    log.info("handle_reply: session=%s status=%s admin=%s interviewee=%s",
+             sid, sess.get("status"), sess.get("admin_user_id"), sess.get("interviewee_user_id"))
+
     # Accept messages from the confirmed interviewee OR the admin
-    # (admin types on behalf of the interviewee in facilitated sessions)
-    is_admin = user_id == sess.get("admin_user_id")
+    is_admin       = user_id == sess.get("admin_user_id")
     is_interviewee = user_id == sess.get("interviewee_user_id")
     if not is_admin and not is_interviewee:
+        log.warning("handle_reply: user %s is neither admin nor interviewee — ignoring", user_id)
         return
 
     # Ignore if paused
     if sess.get("status") == "paused":
+        log.info("handle_reply: session paused — ignoring")
         return
 
     # Add user reply to history
     sess["history"].append({"role": "user", "text": text})
 
-    # Advance question index if they've given enough replies on current question
-    if interview.should_advance_question(sess, text):
-        sess["question_index"] = min(
-            sess.get("question_index", 0) + 1,
-            len(sess.get("guide", {}).get("questions", [])) - 1
-        )
-
-    storage.save_session(sid, sess)
-    await send_typing(chat_id)
-
-    # Advance question index safely
+    # Advance question index if enough replies given on current question
     if interview.should_advance_question(sess, text):
         questions = (sess.get("guide") or {}).get("questions") or []
         if questions:
@@ -404,9 +401,11 @@ async def handle_reply(chat_id: int, user_id: int, text: str, message_id: int):
                 sess.get("question_index", 0) + 1,
                 len(questions) - 1
             )
-        storage.save_session(sid, sess)
 
-    # Get Claude's next message with error handling
+    storage.save_session(sid, sess)
+    await send_typing(chat_id)
+
+    log.info("handle_reply: calling get_next_message...")
     try:
         reply = await interview.get_next_message(sess)
         log.info("Reply generated for session %s, length=%d", sid, len(reply))
@@ -496,6 +495,9 @@ async def webhook(secret: str, request: Request):
     username   = message.get("from", {}).get("username", "")
     text       = message.get("text", "").strip()
     message_id = message.get("message_id")
+
+    log.info("Webhook message: chat=%s user=%s username=%s text=%r has_voice=%s",
+             chat_id, user_id, username, text[:80], bool(message.get("voice") or message.get("audio")))
 
     # ── Handle voice notes and audio messages ────────────────────────────────
     voice = message.get("voice") or message.get("audio")
