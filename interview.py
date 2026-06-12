@@ -153,13 +153,25 @@ async def get_next_message(session: dict) -> str:
     sys_prompt = build_system_prompt(session)
     history    = session.get("history") or []
 
-    # Convert history to Claude message format
+    # Convert history to Claude message format.
+    # Anthropic requires: non-empty content, and roles must alternate
+    # (no two consecutive messages with the same role).
     messages = []
     for msg in history:
         role = "assistant" if msg.get("role") == "assistant" else "user"
-        content = msg.get("text", "")
-        if content:
+        content = (msg.get("text") or "").strip()
+        if not content:
+            continue  # skip empty messages — Anthropic rejects these
+        if messages and messages[-1]["role"] == role:
+            # Merge consecutive same-role messages instead of sending
+            # back-to-back duplicates, which Anthropic also rejects
+            messages[-1]["content"] += "\n\n" + content
+        else:
             messages.append({"role": role, "content": content})
+
+    # Anthropic requires the conversation to start with a "user" message
+    if messages and messages[0]["role"] != "user":
+        messages = messages[1:]
 
     if not messages:
         # First turn — prime Claude to open the interview
