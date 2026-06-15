@@ -9,6 +9,8 @@ import logging
 import httpx
 from config import ANTHROPIC_API_KEY, CLAUDE_MODEL, MAX_TOKENS
 
+log = logging.getLogger(__name__)
+
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 
@@ -187,8 +189,6 @@ async def get_next_message(session: dict) -> str:
             )
         }]
 
-    log = logging.getLogger(__name__)
-
     async with httpx.AsyncClient(timeout=45.0) as client:
         resp = await client.post(
             "https://api.anthropic.com/v1/messages",
@@ -244,12 +244,24 @@ async def generate_insight_report(session: dict) -> dict:
             "confidence": 0
         }
 
+    user_turns = sum(1 for m in history if m.get("role") == "user")
+    if user_turns == 0:
+        return {
+            "summary": "The interview ended before the interviewee provided any responses. "
+                        "No insights could be generated.",
+            "insights": [], "risks": [], "opportunities": [], "actions": [],
+            "confidence": 0
+        }
+
     prompt = (
         f"Interviewee: {name}" + (f", {role}" if role else "") + "\n"
         f"Campaign question: {question}\n\n"
         f"Transcript:\n{transcript}\n\n"
-        "Generate a structured executive insight report. "
-        "Return ONLY valid JSON:\n"
+        "Generate a structured executive insight report. Be concise — "
+        "this will be displayed in a UI card, not a long document.\n"
+        "Limits: summary max 3 sentences. Max 4 insights, each detail max 2 sentences. "
+        "Max 3 risks, max 3 opportunities (each one sentence). Max 4 actions.\n"
+        "Return ONLY valid JSON, no markdown, no preamble:\n"
         '{"summary":"...","insights":[{"title":"...","detail":"..."}],'
         '"risks":["..."],"opportunities":["..."],'
         '"actions":[{"action":"...","owner":"...","timeline":"..."}],'
@@ -266,7 +278,7 @@ async def generate_insight_report(session: dict) -> dict:
             },
             json={
                 "model": CLAUDE_MODEL,
-                "max_tokens": 1500,
+                "max_tokens": 3000,
                 "system": "Generate executive interview insight reports. Return only valid JSON, no markdown.",
                 "messages": [{"role": "user", "content": prompt}],
             },
@@ -277,5 +289,28 @@ async def generate_insight_report(session: dict) -> dict:
             b.get("text", "") for b in (data.get("content") or [])
             if b.get("type") == "text"
         )
+
+        # Strip markdown code fences if present
         clean = raw.replace("```json", "").replace("```", "").strip()
-        return json.loads(clean)
+
+        try:
+            return json.loads(clean)
+        except json.JSONDecodeError as e:
+            # Claude sometimes adds preamble/trailing text around the JSON.
+            # Try to extract just the {...} block.
+            log.error("Report JSON parse failed: %s. Raw response: %s", e, raw[:500])
+            start = clean.find("{")
+            end   = clean.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                try:
+                    return json.loads(clean[start:end+1])
+                except json.JSONDecodeError:
+                    pass
+            # Final fallback — return a minimal valid report rather than crashing
+            return {
+                "summary": "Report generation produced an unexpected format. "
+                            "Raw transcript has been saved.",
+                "insights": [], "risks": [], "opportunities": [], "actions": [],
+                "confidence": 0,
+                "_raw_response": raw[:1000],
+            }
