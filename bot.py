@@ -69,14 +69,14 @@ async def send_typing(chat_id: int):
 
 # ── Voice transcription ───────────────────────────────────────────────────────
 
-async def transcribe_voice(file_id: str) -> str | None:
+async def transcribe_voice(file_id: str) -> tuple[str | None, str | None]:
     """
     Download a Telegram voice/audio file and transcribe it using OpenAI Whisper.
-    Returns the transcript text, or None if transcription fails.
+    Returns (transcript, error_reason). On success: (text, None).
+    On failure: (None, reason) where reason is a short user-facing string.
     """
     if not config.OPENAI_API_KEY:
-        log.warning("OPENAI_API_KEY not set — cannot transcribe voice notes")
-        return None
+        return None, "not_configured"
 
     try:
         # Step 1: get the file path from Telegram
@@ -84,7 +84,7 @@ async def transcribe_voice(file_id: str) -> str | None:
         file_path = file_info.get("result", {}).get("file_path")
         if not file_path:
             log.error("Could not get file_path for file_id %s", file_id)
-            return None
+            return None, "download_failed"
 
         # Step 2: download the audio bytes
         download_url = f"https://api.telegram.org/file/bot{config.TELEGRAM_TOKEN}/{file_path}"
@@ -106,14 +106,27 @@ async def transcribe_voice(file_id: str) -> str | None:
                 files={"file": (filename, audio_bytes, "audio/ogg")},
                 data={"model": "whisper-1", "response_format": "text"},
             )
+
+            if whisper_resp.status_code == 429:
+                body = whisper_resp.text.lower()
+                if "insufficient_quota" in body or "quota" in body:
+                    log.error("Whisper quota exceeded: %s", whisper_resp.text[:200])
+                    return None, "quota_exceeded"
+                log.error("Whisper rate limited: %s", whisper_resp.text[:200])
+                return None, "rate_limited"
+
+            if whisper_resp.status_code == 401:
+                log.error("Whisper auth failed: %s", whisper_resp.text[:200])
+                return None, "invalid_key"
+
             whisper_resp.raise_for_status()
             transcript = whisper_resp.text.strip()
             log.info("Transcribed voice note: %s...", transcript[:80])
-            return transcript
+            return transcript, None
 
     except Exception as e:
         log.error("Transcription failed: %s", e)
-        return None
+        return None, "unknown_error"
 
 
 # ── Session lookup helpers ────────────────────────────────────────────────────
@@ -505,18 +518,38 @@ async def webhook(secret: str, request: Request):
         await send_typing(chat_id)
         await send(chat_id, "_🎙 Voice note received — transcribing..._")
 
-        transcript = await transcribe_voice(file_id)
+        transcript, error = await transcribe_voice(file_id)
 
-        if not transcript:
-            if not config.OPENAI_API_KEY:
-                await send(chat_id,
+        if error:
+            error_messages = {
+                "not_configured": (
                     "⚠️ Voice notes require an OpenAI API key for transcription.\n"
                     "Add `OPENAI_API_KEY` to your Railway environment variables, "
-                    "or type your answer as text.")
-            else:
-                await send(chat_id,
+                    "or type your answer as text."
+                ),
+                "invalid_key": (
+                    "⚠️ OpenAI API key is invalid. Check `OPENAI_API_KEY` in Railway "
+                    "Variables, or type your answer as text."
+                ),
+                "quota_exceeded": (
+                    "⚠️ OpenAI account has no available quota for transcription.\n"
+                    "Add a payment method at platform.openai.com → Settings → Billing, "
+                    "or type your answer as text."
+                ),
+                "rate_limited": (
+                    "⚠️ Transcription is rate-limited right now. "
+                    "Please wait a moment and try again, or type your answer."
+                ),
+                "download_failed": (
+                    "⚠️ Could not download the voice note from Telegram. "
+                    "Please try again or type your answer."
+                ),
+                "unknown_error": (
                     "⚠️ Could not transcribe the voice note. "
-                    "Please try again or type your answer.")
+                    "Please try again or type your answer."
+                ),
+            }
+            await send(chat_id, error_messages.get(error, error_messages["unknown_error"]))
             return JSONResponse({"ok": True})
 
         # Show the transcript so the user can confirm what was heard
@@ -608,6 +641,55 @@ async def get_report(session_id: str):
         "report": report,
         "transcript": sess.get("history", []),
     })
+
+
+@app.get("/report-embed/{session_id}", response_class=HTMLResponse)
+async def report_embed(session_id: str):
+    """
+    Tiny page meant to be loaded in a hidden iframe from Gaura.
+    Loads the report for this session and posts it to the parent window
+    via postMessage — this works even when the parent page (a Claude
+    artifact) has its outgoing fetch() calls blocked by CSP, because
+    postMessage and iframe loading are not subject to that restriction.
+    """
+    sess = storage.load_session(session_id)
+
+    if not sess:
+        payload = json.dumps({"ok": False, "error": "session_not_found", "session_id": session_id})
+    else:
+        report = sess.get("report")
+        if not report:
+            payload = json.dumps({
+                "ok": False,
+                "error": "not_ready",
+                "session_id": session_id,
+                "status": sess.get("status"),
+            })
+        else:
+            payload = json.dumps({
+                "ok": True,
+                "session_id": session_id,
+                "interviewee_name": sess.get("interviewee_name"),
+                "status": sess.get("status"),
+                "report": report,
+                "transcript": sess.get("history", []),
+            })
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"></head>
+<body>
+<script>
+  var payload = {payload};
+  // Post to parent window (Gaura artifact). "*" target is fine here —
+  // the payload contains only this session's own interview data.
+  if (window.parent) {{
+    window.parent.postMessage({{ source: "gaura-telegram-report", data: payload }}, "*");
+  }}
+</script>
+</body>
+</html>"""
+    return HTMLResponse(html)
 
 
 # ── Health check ──────────────────────────────────────────────────────────────
