@@ -67,7 +67,9 @@ def build_system_prompt(session: dict) -> str:
 
     nearing_str = (
         "\n⚠️ You are on the LAST question. After their answer, "
-        "summarise the 3-4 key themes you heard and close warmly.\n"
+        "summarise the 3-4 key themes you heard and say something like "
+        "'That covers everything I wanted to explore — thank you so much for your time today.' "
+        "Do NOT say the interview is over or finished. The admin will formally close the session.\n"
         if nearing_end else ""
     )
 
@@ -114,40 +116,10 @@ def should_advance_question(session: dict, user_reply: str) -> bool:
     if not questions or q_index >= len(questions) - 1:
         return False
 
-    # Count user turns since last advance — rough heuristic
-    user_turns = sum(1 for m in history[-6:] if m.get("role") == "user")
-    return user_turns >= 2
-
-
-def is_interview_complete(session: dict) -> bool:
-    """
-    Interview is complete when Claude has sent a closing message.
-    """
-    history   = session.get("history") or []
-    questions = (session.get("guide") or {}).get("questions") or []
-    q_index   = session.get("question_index", 0)
-
-    # Need at least a few turns
-    if len(history) < 4:
-        return False
-
-    # If there's a guide, must be on or past the last question
-    if questions and q_index < len(questions) - 1:
-        return False
-
-    # Check if Claude's last message contains closing language
-    last_ai = next(
-        (m.get("text", "") for m in reversed(history) if m.get("role") == "assistant"),
-        ""
-    )
-    closing_signals = [
-        "thank you", "thanks for", "that's been", "that has been",
-        "really helpful", "we've covered", "we have covered",
-        "to summarise", "to summarize", "key themes", "wrap up",
-        "been very helpful", "appreciate your time"
-    ]
-    return any(sig in last_ai.lower() for sig in closing_signals)
-
+    # Advance after 3 user turns on the current question —
+    # gives enough depth before moving on (was 2, too fast for short guides)
+    user_turns = sum(1 for m in history[-8:] if m.get("role") == "user")
+    return user_turns >= 3
 
 # ── Call Claude ───────────────────────────────────────────────────────────────
 
