@@ -197,19 +197,26 @@ async def handle_setup(chat_id: int, user_id: int, args: list[str]):
 async def handle_start(chat_id: int, user_id: int, username: str):
     """
     /start — begins the interview.
-    Can be sent by the interviewee OR the admin (for facilitated sessions).
+    If sent by the admin: opens the interview without touching interviewee_user_id.
+    If sent by a non-admin: registers them as the interviewee and opens.
     """
     sid, sess = find_session_for_group(chat_id)
     if not sess:
         await send(chat_id, "No active session found for this group. Ask the admin to run `/setup` first.")
         return
 
-    # Register whoever sends /start as the interviewee
-    sess["interviewee_user_id"] = user_id
+    # Only register as interviewee if the sender is NOT the admin.
+    # This allows the admin to fire /start to open the interview,
+    # while keeping the interviewee slot free for the real person.
+    if user_id != sess.get("admin_user_id"):
+        sess["interviewee_user_id"] = user_id
+        log.info("Interviewee registered: user=%s session=%s", user_id, sid)
+    else:
+        log.info("Admin started interview without overwriting interviewee slot: session=%s", sid)
+
     sess["status"] = "active"
     storage.save_session(sid, sess)
 
-    log.info("Interview starting: session=%s user=%s", sid, user_id)
     await send_typing(chat_id)
 
     try:
@@ -227,7 +234,6 @@ async def handle_start(chat_id: int, user_id: int, username: str):
     # Store the opening turn
     sess["history"].append({"role": "assistant", "text": reply})
     storage.save_session(sid, sess)
-
     await send(chat_id, reply)
 
 
@@ -392,6 +398,17 @@ async def handle_reply(chat_id: int, user_id: int, text: str, message_id: int):
     # (admin can type on behalf of the interviewee in facilitated sessions)
     is_admin       = user_id == sess.get("admin_user_id")
     is_interviewee = user_id == sess.get("interviewee_user_id")
+
+    # If interviewee slot is empty and this is not the admin,
+    # auto-register them — handles cases where the real interviewee
+    # writes without sending /start first, or where admin started
+    # the interview and the interviewee slot was never set.
+    if not is_admin and not is_interviewee and not sess.get("interviewee_user_id"):
+        sess["interviewee_user_id"] = user_id
+        storage.save_session(sid, sess)
+        is_interviewee = True
+        log.info("Auto-registered interviewee: user=%s session=%s", user_id, sid)
+
     if not is_admin and not is_interviewee:
         return
 
@@ -430,17 +447,13 @@ async def handle_reply(chat_id: int, user_id: int, text: str, message_id: int):
     storage.save_session(sid, sess)
     await send(chat_id, reply)
 
-    # Check if interview is naturally complete
-    if interview.is_interview_complete(sess):
-        await finish_interview(sid, sess, chat_id, early=False)
-
 
 async def finish_interview(sid: str, sess: dict, chat_id: int, early: bool = False):
     """Generate the insight report and notify the group."""
     sess["status"] = "complete"
     storage.save_session(sid, sess)
 
-    msg = "_Interview ended by admin._\n\n" if early else "_Interview complete._\n\n"
+    msg = "_Interview ended. Generating insight report..._\n\n"
     await send(chat_id, msg + "Generating insight report...")
     await send_typing(chat_id)
 
