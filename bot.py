@@ -466,7 +466,8 @@ async def finish_interview(sid: str, sess: dict, chat_id: int, early: bool = Fal
         summary = report.get("summary", "")
         insights = report.get("insights", [])
         actions  = report.get("actions", [])
-        confidence = report.get("confidence", "")
+        confidence        = report.get("confidence", "")
+        confidence_reason = report.get("confidence_reason", "")
 
         report_text = (
             f"*Interview complete — Insight Report*\n\n"
@@ -482,6 +483,8 @@ async def finish_interview(sid: str, sess: dict, chat_id: int, early: bool = Fal
             for i, a in enumerate(actions[:3], 1):
                 report_text += f"{i}. {a.get('action','')} — {a.get('owner','')} ({a.get('timeline','')})\n"
         report_text += f"\n_Confidence: {confidence}%_"
+        if confidence_reason:
+            report_text += f"\n_{confidence_reason}_"
 
         await send(chat_id, report_text)
         await send(
