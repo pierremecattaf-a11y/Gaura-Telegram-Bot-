@@ -233,11 +233,16 @@ async def generate_insight_report(session: dict) -> dict:
         "this will be displayed in a UI card, not a long document.\n"
         "Limits: summary max 3 sentences. Max 4 insights, each detail max 2 sentences. "
         "Max 3 risks, max 3 opportunities (each one sentence). Max 4 actions.\n"
+        "For the confidence score (0-100), consider: depth and specificity of answers, "
+        "coverage of the campaign question, consistency of responses, and quality of evidence.\n"
+        "For confidence_reason: 1-2 sentences explaining what drove the score up or down "
+        "(e.g. 'The interviewee gave concrete examples and covered all key areas' or "
+        "'Several questions received brief answers and the pricing data was vague').\n"
         "Return ONLY valid JSON, no markdown, no preamble:\n"
         '{"summary":"...","insights":[{"title":"...","detail":"..."}],'
         '"risks":["..."],"opportunities":["..."],'
         '"actions":[{"action":"...","owner":"...","timeline":"..."}],'
-        '"confidence":87}'
+        '"confidence":87,"confidence_reason":"..."}'
     )
 
     async with httpx.AsyncClient(timeout=60.0) as client:
