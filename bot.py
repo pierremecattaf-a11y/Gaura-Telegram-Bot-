@@ -727,6 +727,82 @@ async def debug():
     }
 
 
+# ── Claude proxy endpoints (used by the Gaura web app) ───────────────────────
+# Browsers cannot call api.anthropic.com directly due to CORS.
+# These endpoints sit on Railway (same-origin as the API key) and proxy
+# Claude requests on behalf of the web app — the API key never touches
+# the browser.
+
+@app.post("/proxy/chat")
+async def proxy_chat(request: Request):
+    """
+    Proxy a standard Claude chat request.
+    Body: { model, max_tokens, system, messages }
+    """
+    if not config.ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured on server")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    # Only allow fields Claude actually needs — strip anything else
+    payload = {
+        "model":      body.get("model", config.CLAUDE_MODEL),
+        "max_tokens": int(body.get("max_tokens", 1000)),
+        "messages":   body["messages"],
+    }
+    if body.get("system"):
+        payload["system"] = body["system"]
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key":         config.ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type":      "application/json",
+            },
+            json=payload,
+        )
+    return JSONResponse(content=resp.json(), status_code=resp.status_code)
+
+
+@app.post("/proxy/search")
+async def proxy_search(request: Request):
+    """
+    Proxy a Claude request that includes the web_search tool.
+    Body: { model, max_tokens, system, messages }
+    """
+    if not config.ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured on server")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    payload = {
+        "model":      body.get("model", config.CLAUDE_MODEL),
+        "max_tokens": int(body.get("max_tokens", 2000)),
+        "messages":   body["messages"],
+        "tools":      [{"type": "web_search_20250305", "name": "web_search"}],
+    }
+    if body.get("system"):
+        payload["system"] = body["system"]
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key":         config.ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type":      "application/json",
+            },
+            json=payload,
+        )
+    return JSONResponse(content=resp.json(), status_code=resp.status_code)
+
+
 # ── Register webhook (run once) ───────────────────────────────────────────────
 
 @app.on_event("startup")
@@ -918,5 +994,3 @@ function showErr(msg) {{
 </body>
 </html>"""
     return HTMLResponse(html)
-
-
