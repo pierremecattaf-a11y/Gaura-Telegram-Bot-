@@ -21,7 +21,7 @@ def save_session(session_id: str, data: dict):
     data["updated_at"] = time.time()
     if STORAGE_BACKEND == "redis":
         r = _redis_client()
-        r.set("session:" + session_id, json.dumps(data), ex=86400 * 7)  # 7 days
+        r.set("session:" + session_id, json.dumps(data), ex=86400 * 7)
     else:
         _store[session_id] = data
 
@@ -50,6 +50,17 @@ def list_sessions() -> list[str]:
     return list(_store.keys())
 
 
+def find_session_by_phone(phone: str) -> tuple[str, dict] | tuple[None, None]:
+    """Find an active session registered to a given phone number."""
+    for sid in list_sessions():
+        sess = load_session(sid)
+        if (sess
+                and sess.get("interviewee_phone") == phone
+                and sess.get("status") in ("pending", "active")):
+            return sid, sess
+    return None, None
+
+
 # ── Session factory ───────────────────────────────────────────────────────────
 
 def new_session(
@@ -58,25 +69,30 @@ def new_session(
     interviewee_role: str,
     guide: dict,
     config: dict,
-    mode: str = "group",
+    mode: str = "group",          # "group" | "dm" | "phone"
+    interviewee_phone: str = "",  # E.164 format, e.g. +447911123456
 ) -> dict:
     """Create a fresh session dict. Save it yourself after calling this."""
     slug = interviewee_name.lower().replace(" ", "-")
     session_id = campaign_id + "_" + slug + "_" + str(int(time.time()))[-6:]
     return {
-        "session_id": session_id,
-        "campaign_id": campaign_id,
-        "interviewee_name": interviewee_name,
-        "interviewee_role": interviewee_role,
-        "guide": guide,
-        "config": config,
-        "history": [],           # list of {role, text}
-        "question_index": 0,     # which guide question we're on
-        "status": "pending",     # pending → active → complete
-        "mode": mode,            # "group" or "dm"
-        "group_chat_id": None,   # set when /start is received in the group
-        "interviewee_user_id": None,  # set when interviewee is confirmed
-        "admin_user_id": None,   # the campaign owner (you)
-        "created_at": time.time(),
-        "updated_at": time.time(),
+        "session_id":         session_id,
+        "campaign_id":        campaign_id,
+        "interviewee_name":   interviewee_name,
+        "interviewee_role":   interviewee_role,
+        "interviewee_phone":  interviewee_phone,  # for phone channel identification
+        "guide":              guide,
+        "config":             config,
+        "history":            [],        # list of {role, text}
+        "question_index":     0,
+        "status":             "pending", # pending → active → complete
+        "channel":            mode,      # "group" | "dm" | "phone"
+        # Telegram-specific (unused for phone channel)
+        "group_chat_id":      None,
+        "interviewee_user_id": None,
+        "admin_user_id":      None,
+        # Phone-specific (unused for Telegram channel)
+        "call_sid":           None,      # Twilio CallSid
+        "created_at":         time.time(),
+        "updated_at":         time.time(),
     }
