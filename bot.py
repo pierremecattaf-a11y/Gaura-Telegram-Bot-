@@ -448,54 +448,67 @@ async def handle_reply(chat_id: int, user_id: int, text: str, message_id: int):
     await send(chat_id, reply)
 
 
-async def finish_interview(sid: str, sess: dict, chat_id: int, early: bool = False):
-    """Generate the insight report and notify the group."""
-    sess["status"] = "complete"
-    storage.save_session(sid, sess)
-
-    msg = "_Interview ended. Generating insight report..._\n\n"
-    await send(chat_id, msg + "Generating insight report...")
-    await send_typing(chat_id)
-
+async def generate_and_store_report(sid: str, sess: dict) -> dict | None:
+    """
+    Generate the insight report for any session (Telegram or phone),
+    store it, and return it. Returns None on failure.
+    Channel-agnostic — can be called from finish_interview, call status
+    webhook, or the REST endpoint below.
+    """
     try:
         report = await interview.generate_insight_report(sess)
         sess["report"] = report
+        sess["status"] = "complete"
         storage.save_session(sid, sess)
-
-        # Post a summary to the group
-        summary = report.get("summary", "")
-        insights = report.get("insights", [])
-        actions  = report.get("actions", [])
-        confidence        = report.get("confidence", "")
-        confidence_reason = report.get("confidence_reason", "")
-
-        report_text = (
-            f"*Interview complete — Insight Report*\n\n"
-            f"*Summary:*\n{summary}\n\n"
-        )
-        if insights:
-            report_text += "*Key insights:*\n"
-            for ins in insights[:3]:
-                report_text += f"• *{ins.get('title','')}: * {ins.get('detail','')}\n"
-            report_text += "\n"
-        if actions:
-            report_text += "*Recommended actions:*\n"
-            for i, a in enumerate(actions[:3], 1):
-                report_text += f"{i}. {a.get('action','')} — {a.get('owner','')} ({a.get('timeline','')})\n"
-        report_text += f"\n_Confidence: {confidence}%_"
-        if confidence_reason:
-            report_text += f"\n_{confidence_reason}_"
-
-        await send(chat_id, report_text)
-        await send(
-            chat_id,
-            f"_Full report saved. Session ID: `{sid}`_\n"
-            f"_Open Gaura to view the complete insights._"
-        )
-
+        log.info("Report generated and stored for session %s", sid)
+        return report
     except Exception as e:
-        log.error("Report generation failed: %s", e)
+        log.error("Report generation failed for session %s: %s", sid, e)
+        return None
+
+
+async def finish_interview(sid: str, sess: dict, chat_id: int, early: bool = False):
+    """End a Telegram interview, generate report, post summary to group."""
+    sess["status"] = "complete"
+    storage.save_session(sid, sess)
+
+    await send(chat_id, "_Interview ended. Generating insight report..._")
+    await send_typing(chat_id)
+
+    report = await generate_and_store_report(sid, sess)
+
+    if not report:
         await send(chat_id, "Report generation failed. Transcript has been saved — you can generate the report manually in Gaura.")
+        return
+
+    summary           = report.get("summary", "")
+    insights          = report.get("insights", [])
+    actions           = report.get("actions", [])
+    confidence        = report.get("confidence", "")
+    confidence_reason = report.get("confidence_reason", "")
+
+    report_text = (
+        f"*Interview complete — Insight Report*\n\n"
+        f"*Summary:*\n{summary}\n\n"
+    )
+    if insights:
+        report_text += "*Key insights:*\n"
+        for ins in insights[:3]:
+            report_text += f"• *{ins.get('title','')}: * {ins.get('detail','')}\n"
+        report_text += "\n"
+    if actions:
+        report_text += "*Recommended actions:*\n"
+        for i, a in enumerate(actions[:3], 1):
+            report_text += f"{i}. {a.get('action','')} — {a.get('owner','')} ({a.get('timeline','')})\n"
+    report_text += f"\n_Confidence: {confidence}%_"
+    if confidence_reason:
+        report_text += f"\n_{confidence_reason}_"
+
+    await send(chat_id, report_text)
+    await send(chat_id,
+        f"_Full report saved. Session ID: `{sid}`_\n"
+        f"_Open Gaura to view the complete insights._"
+    )
 
 
 # ── Webhook endpoint ──────────────────────────────────────────────────────────
@@ -622,6 +635,7 @@ async def create_session(request: Request):
         guide              = body["guide"],
         config             = body.get("config", {}),
         mode               = body.get("mode", config.INTERVIEW_MODE),
+        interviewee_phone  = body.get("interviewee_phone", ""),
     )
     storage.save_session(sess["session_id"], sess)
 
@@ -651,11 +665,32 @@ async def get_report(session_id: str):
     if not report:
         raise HTTPException(status_code=404, detail="Report not yet generated")
     return JSONResponse({
-        "session_id": session_id,
+        "session_id":       session_id,
         "interviewee_name": sess.get("interviewee_name"),
-        "status": sess.get("status"),
-        "report": report,
-        "transcript": sess.get("history", []),
+        "status":           sess.get("status"),
+        "report":           report,
+        "transcript":       sess.get("history", []),
+    })
+
+
+@app.post("/session/{session_id}/generate-report")
+async def trigger_report(session_id: str):
+    """
+    Generate (or regenerate) the insight report for any session,
+    regardless of channel. Called automatically after a phone call ends,
+    or manually from the Gaura web app.
+    """
+    sess = storage.load_session(session_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    report = await generate_and_store_report(session_id, sess)
+    if not report:
+        raise HTTPException(status_code=500, detail="Report generation failed")
+
+    return JSONResponse({
+        "session_id": session_id,
+        "report":     report,
     })
 
 
