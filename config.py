@@ -1,30 +1,37 @@
 import os
 
+def _env(key, default=""):
+    """Read an env var and strip whitespace/newlines that Railway sometimes
+    adds when variables are pasted or set via the dashboard."""
+    return os.environ.get(key, default).strip()
+
 # ── Telegram ──────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "gaura-secret-2024")
+TELEGRAM_TOKEN = _env("TELEGRAM_TOKEN")
+WEBHOOK_SECRET = _env("WEBHOOK_SECRET", "gaura-secret-2024")
 
 # ── Claude ────────────────────────────────────────────────────────────────────
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+ANTHROPIC_API_KEY = _env("ANTHROPIC_API_KEY")
 CLAUDE_MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 400
 
 # ── Speech-to-text (OpenAI Whisper) ──────────────────────────────────────────
-# Used to transcribe Telegram voice notes into text.
-# Get a key at platform.openai.com — costs ~$0.006/min of audio.
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_API_KEY = _env("OPENAI_API_KEY")
+
+# ── Twilio (phone call interviews) ────────────────────────────────────────────
+TWILIO_ACCOUNT_SID   = _env("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN    = _env("TWILIO_AUTH_TOKEN")
+TWILIO_PHONE_NUMBER  = _env("TWILIO_PHONE_NUMBER")
+
+# ── Bland.ai (phone call interviews — replaces Twilio) ────────────────────────
+BLAND_API_KEY = _env("BLAND_API_KEY")
 
 # ── Interview mode ────────────────────────────────────────────────────────────
-# "group"  — bot is in a group with you + interviewee; you can observe live
-# "dm"     — bot DMs the interviewee directly; you see transcript after
-INTERVIEW_MODE = os.environ.get("INTERVIEW_MODE", "group")
+INTERVIEW_MODE = _env("INTERVIEW_MODE", "group")
 
 # ── Storage backend ───────────────────────────────────────────────────────────
-# "memory" — dict in RAM (fine for testing, resets on restart)
-# "redis"  — persistent (set REDIS_URL env var)
-STORAGE_BACKEND = os.environ.get("STORAGE_BACKEND", "memory")
-REDIS_URL = os.environ.get("REDIS_URL", "")
+STORAGE_BACKEND = _env("STORAGE_BACKEND", "memory")
+REDIS_URL = _env("REDIS_URL")
 
 # ── Server ────────────────────────────────────────────────────────────────────
-PORT = int(os.environ.get("PORT", 8000))
-BASE_URL = os.environ.get("BASE_URL", "")  # e.g. https://gaura-bot.up.railway.app
+PORT = int(_env("PORT", "8000"))
+BASE_URL = _env("BASE_URL")  # e.g. https://gaura-bot.up.railway.app
