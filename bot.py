@@ -19,7 +19,7 @@ import base64
 import httpx
 import logging
 from urllib.parse import unquote
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -754,14 +754,18 @@ async def health():
 async def debug():
     """Shows whether config is loaded correctly, without exposing secrets."""
     return {
-        "claude_model":       config.CLAUDE_MODEL,
-        "anthropic_key_set":  bool(config.ANTHROPIC_API_KEY),
-        "telegram_token_set": bool(config.TELEGRAM_TOKEN),
+        "claude_model":          config.CLAUDE_MODEL,
+        "anthropic_key_set":     bool(config.ANTHROPIC_API_KEY),
+        "telegram_token_set":    bool(config.TELEGRAM_TOKEN),
         "telegram_token_length": len(config.TELEGRAM_TOKEN),
-        "base_url":           config.BASE_URL or "NOT SET",
-        "interview_mode":     config.INTERVIEW_MODE,
-        "storage_backend":    config.STORAGE_BACKEND,
-        "openai_key_set":     bool(config.OPENAI_API_KEY),
+        "base_url":              config.BASE_URL or "NOT SET",
+        "interview_mode":        config.INTERVIEW_MODE,
+        "storage_backend":       config.STORAGE_BACKEND,
+        "openai_key_set":        bool(config.OPENAI_API_KEY),
+        "twilio_configured":     bool(config.TWILIO_ACCOUNT_SID),
+        "twilio_phone":          config.TWILIO_PHONE_NUMBER or "NOT SET",
+        "call_inbound_url":      (config.BASE_URL or "") + "/call/inbound",
+        "call_status_url":       (config.BASE_URL or "") + "/call/status",
     }
 
 
@@ -841,6 +845,176 @@ async def proxy_search(request: Request):
     return JSONResponse(content=resp.json(), status_code=resp.status_code)
 
 
+# -- Bland.ai phone call endpoints -------------------------------------------
+#
+# Bland.ai handles the full voice loop (STT + LLM + TTS).
+# We send one API call to start the interview, and receive a webhook
+# when it ends with the full transcript.
+
+
+async def call_bland(phone: str, task: str, webhook_url: str,
+                     max_duration: int = 45) -> dict:
+    """Send an outbound call via Bland.ai."""
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            "https://api.bland.ai/v1/calls",
+            headers={
+                "authorization": config.BLAND_API_KEY,
+                "Content-Type":  "application/json",
+            },
+            json={
+                "phone_number":      phone,
+                "task":              task,
+                "voice":             "maya",
+                "language":          "en",
+                "max_duration":      max_duration,
+                "webhook":           webhook_url,
+                "wait_for_greeting": True,
+                "record":            True,
+                "reduce_latency":    True,
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+@app.post("/call/start")
+async def call_start(request: Request):
+    """
+    Gaura web app calls this when the user clicks the Call button.
+    Body: { session_id }
+    Looks up the session, builds the prompt, and dials via Bland.
+    """
+    if not config.BLAND_API_KEY:
+        raise HTTPException(status_code=503, detail="BLAND_API_KEY not configured")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    session_id = body.get("session_id", "")
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id required")
+
+    sess = storage.load_session(session_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    phone = sess.get("interviewee_phone", "")
+    if not phone:
+        raise HTTPException(status_code=400,
+                            detail="No phone number registered for this session")
+
+    sys_prompt = interview.build_system_prompt(sess)
+    task = (
+        sys_prompt + "\n\n"
+        "VOICE CALL RULES:\n"
+        "- Keep each response to 2-3 sentences maximum.\n"
+        "- Speak naturally. No bullet points, no lists, no markdown.\n"
+        "- Wait for the person to finish before responding.\n"
+        "- When all guide questions are covered, thank them warmly and end the call."
+    )
+
+    webhook_url = config.BASE_URL.rstrip("/") + "/call/webhook"
+
+    try:
+        result = await call_bland(phone, task, webhook_url)
+        call_id = result.get("call_id", "")
+        log.info("Bland call started: call_id=%s session=%s phone=%s",
+                 call_id, session_id, phone)
+
+        sess["call_sid"] = call_id
+        sess["status"]   = "active"
+        sess["channel"]  = "phone"
+        storage.save_session(session_id, sess)
+
+        return JSONResponse({
+            "ok":         True,
+            "call_id":    call_id,
+            "session_id": session_id,
+            "message":    "Call initiated to " + phone,
+        })
+
+    except httpx.HTTPStatusError as e:
+        log.error("Bland error: %s %s", e.response.status_code, e.response.text[:200])
+        raise HTTPException(status_code=502,
+                            detail="Bland API error: " + e.response.text[:200])
+    except Exception as e:
+        log.error("Call start failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/call/webhook")
+async def call_webhook(request: Request):
+    """
+    Bland.ai POSTs here when a call ends with the full transcript.
+    We store it and auto-generate the insight report.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    call_id    = body.get("call_id", "")
+    status     = body.get("status", "")
+    transcript = body.get("transcripts") or []
+    concat     = body.get("concatenated_transcript", "")
+    duration   = body.get("call_length", 0)
+
+    log.info("Bland webhook: call_id=%s status=%s duration=%ss turns=%d",
+             call_id, status, duration, len(transcript))
+
+    # Find session by call_id
+    sid, sess = None, None
+    for s in storage.list_sessions():
+        candidate = storage.load_session(s)
+        if candidate and candidate.get("call_sid") == call_id:
+            sid, sess = s, candidate
+            break
+
+    if not sess:
+        log.warning("No session for Bland call_id %s", call_id)
+        return JSONResponse({"ok": True})
+
+    # Convert Bland transcript to our history format
+    history = []
+    for turn in transcript:
+        role = turn.get("role", "")
+        text = (turn.get("text") or "").strip()
+        if not text:
+            continue
+        if role in ("assistant", "agent"):
+            history.append({"role": "assistant", "text": text})
+        elif role in ("user", "human"):
+            history.append({"role": "user", "text": text})
+
+    # Fallback: parse concatenated_transcript string
+    if not history and concat:
+        for line in concat.split("\n"):
+            line = line.strip()
+            low = line.lower()
+            if low.startswith("assistant:"):
+                history.append({"role": "assistant", "text": line[10:].strip()})
+            elif low.startswith("user:"):
+                history.append({"role": "user", "text": line[5:].strip()})
+
+    sess["history"]       = history
+    sess["status"]        = "complete"
+    sess["call_duration"] = duration
+    storage.save_session(sid, sess)
+
+    user_turns = sum(1 for m in history if m.get("role") == "user")
+    if user_turns == 0:
+        log.info("Call %s had no user responses — skipping report", call_id)
+        return JSONResponse({"ok": True})
+
+    log.info("Generating report for phone session %s (%d user turns)", sid, user_turns)
+    await generate_and_store_report(sid, sess)
+    return JSONResponse({"ok": True})
+
+
+
 # ── Register webhook (run once) ───────────────────────────────────────────────
 
 @app.on_event("startup")
@@ -861,6 +1035,14 @@ async def startup_checks():
         log.warning("=" * 60)
     else:
         log.info("All required environment variables are set.")
+
+    if config.TWILIO_ACCOUNT_SID:
+        log.info("Twilio configured — phone number: %s", config.TWILIO_PHONE_NUMBER or "NOT SET")
+        log.info("Configure Twilio webhook URLs in your Twilio console:")
+        log.info("  Inbound call:  POST %s/call/inbound", config.BASE_URL)
+        log.info("  Call status:   POST %s/call/status", config.BASE_URL)
+    else:
+        log.info("Twilio not configured — phone call interviews disabled")
 
     # Register webhook
     if config.BASE_URL and config.TELEGRAM_TOKEN:
