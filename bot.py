@@ -1064,6 +1064,8 @@ async def create_page(
     campaign_id: str = "",
     name: str = "",
     role: str = "",
+    phone: str = "",
+    mode: str = "group",
     tone: str = "Conversational",
     depth: str = "Deep",
     length: str = "standard",
@@ -1132,52 +1134,76 @@ async def create_page(
 <body>
 <div class="card">
   <div class="logo">G</div>
-  <h1>Create interview session</h1>
-  <p class="sub">This will register a Telegram interview session and give you the setup command.</p>
+  <h1 id="page-title">Create interview session</h1>
+  <p class="sub" id="page-sub"></p>
 
   <div class="meta">
     <strong>Interviewee:</strong> {safe_n}<br>
     <strong>Role:</strong> {safe_r or "—"}<br>
+    {"<strong>Phone:</strong> " + phone + "<br>" if phone else ""}
     <strong>Guide:</strong> <span class="q-count" id="q-count">loading...</span>
   </div>
 
   <button class="btn" id="create-btn" onclick="createSession()">
-    Create Telegram session
+    Loading...
   </button>
 
-  <div class="result" id="result">
-    <h3>✅ Session created</h3>
+  <!-- Telegram result -->
+  <div class="result" id="tg-result">
+    <h3>✅ Telegram session created</h3>
     <p class="steps" id="steps"></p>
     <div class="cmd-row">
       <input class="cmd" id="cmd" readonly onclick="this.select()" />
       <button class="copy-btn" onclick="copyCmd()">Copy</button>
     </div>
   </div>
+
+  <!-- Phone result -->
+  <div class="result" id="phone-result">
+    <h3>📞 Call initiated</h3>
+    <p class="steps" id="phone-steps"></p>
+  </div>
+
   <div class="error" id="err"></div>
 </div>
 
 <script>
 var GUIDE = {guide_json};
+var MODE  = '{mode}';
+var PHONE = '{phone}';
+
 var qCount = (GUIDE && GUIDE.questions) ? GUIDE.questions.length : 0;
 document.getElementById('q-count').textContent = qCount + ' question' + (qCount !== 1 ? 's' : '');
+
+if (MODE === 'phone') {{
+  document.getElementById('page-title').textContent = 'Start phone interview';
+  document.getElementById('page-sub').textContent   = 'This will register the session and call ' + (PHONE || 'the interviewee') + ' via Bland.ai.';
+  document.getElementById('create-btn').textContent = 'Start call now';
+}} else {{
+  document.getElementById('page-title').textContent = 'Create Telegram session';
+  document.getElementById('page-sub').textContent   = 'This will register a Telegram interview session and give you the setup command.';
+  document.getElementById('create-btn').textContent = 'Create Telegram session';
+}}
 
 async function createSession() {{
   var btn = document.getElementById('create-btn');
   btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span> Creating...';
+  btn.innerHTML = '<span class="spinner"></span> ' + (MODE === 'phone' ? 'Calling...' : 'Creating...');
   document.getElementById('err').style.display = 'none';
 
   try {{
+    // Step 1 — create the session
     var res = await fetch('/create-session', {{
       method: 'POST',
       headers: {{'Content-Type': 'application/json'}},
       body: JSON.stringify({{
-        campaign_id:      '{campaign_id}',
-        interviewee_name: '{safe_n}',
-        interviewee_role: '{safe_r}',
-        guide:            GUIDE,
-        config:           {{tone:'{tone}', depth:'{depth}', length:'{length}'}},
-        mode:             'group'
+        campaign_id:       '{campaign_id}',
+        interviewee_name:  '{safe_n}',
+        interviewee_role:  '{safe_r}',
+        interviewee_phone: '{phone}',
+        guide:             GUIDE,
+        config:            {{tone:'{tone}', depth:'{depth}', length:'{length}'}},
+        mode:              '{mode}'
       }})
     }});
     if (!res.ok) {{
@@ -1185,14 +1211,37 @@ async function createSession() {{
       throw new Error('Server error ' + res.status + ': ' + txt.slice(0,200));
     }}
     var data = await res.json();
-    document.getElementById('steps').textContent = data.instructions;
-    document.getElementById('cmd').value         = data.setup_command;
-    document.getElementById('result').style.display = 'block';
-    btn.style.display = 'none';
+    var sessionId = data.session_id;
+
+    if (MODE === 'phone') {{
+      // Step 2 — initiate the Bland.ai call
+      var callRes = await fetch('/call/start', {{
+        method: 'POST',
+        headers: {{'Content-Type': 'application/json'}},
+        body: JSON.stringify({{ session_id: sessionId }})
+      }});
+      if (!callRes.ok) {{
+        var callTxt = await callRes.text();
+        throw new Error('Call failed: ' + callTxt.slice(0,200));
+      }}
+      var callData = await callRes.json();
+      document.getElementById('phone-steps').textContent =
+        'Bland.ai is calling ' + (PHONE || 'the interviewee') + ' now. ' +
+        'The insight report will appear in Gaura automatically when the call ends. ' +
+        'Session ID: ' + sessionId;
+      document.getElementById('phone-result').style.display = 'block';
+      btn.style.display = 'none';
+    }} else {{
+      // Telegram — show the /setup command
+      document.getElementById('steps').textContent = data.instructions;
+      document.getElementById('cmd').value         = data.setup_command;
+      document.getElementById('tg-result').style.display = 'block';
+      btn.style.display = 'none';
+    }}
   }} catch(e) {{
     showErr('Failed: ' + e.message);
     btn.disabled = false;
-    btn.innerHTML = 'Create Telegram session';
+    btn.textContent = MODE === 'phone' ? 'Start call now' : 'Create Telegram session';
   }}
 }}
 
